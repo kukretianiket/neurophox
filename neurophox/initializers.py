@@ -1,4 +1,4 @@
-from typing import Tuple, Union, Optional
+from typing import Tuple, Union, Optional, Callable
 
 import tensorflow as tf
 
@@ -35,7 +35,7 @@ class MeshPhaseInitializer:
         """
         raise NotImplementedError('Need to implement numpy initialization')
 
-    def to_tf(self, phase_varname: str) -> tf.Variable:
+    def to_tf(self, phase_varname: str, constraint : Optional[Callable] = None) -> tf.Variable:
         """
 
         Returns:
@@ -45,6 +45,7 @@ class MeshPhaseInitializer:
         return tf.Variable(
             name=phase_varname,
             initial_value=phase_np,
+            constraint=constraint,
             dtype=TF_FLOAT
         )
 
@@ -158,6 +159,8 @@ class UniformRandomPhaseInitializer(MeshPhaseInitializer):
 
     def to_np(self) -> np.ndarray:
         phase = (self.max_phase - self.min_phase) * np.random.rand(self.num_layers, self.units // 2) + self.min_phase
+        if self.units % 2 == 0:
+            phase[1::2, -1] = 0
         return phase.astype(NP_FLOAT)
 
 

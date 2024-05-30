@@ -485,6 +485,7 @@ class MeshLayer(TransformerLayer):
     def __init__(self, mesh_model: MeshModel, activation: Activation = None,
                  incoherent: bool = False,
                  phase_loss_fn: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
+                 constraint_fns : Optional[List[Callable]] = None,
                  **kwargs):
         self.mesh = Mesh(mesh_model)
         self.units, self.num_layers = self.mesh.units, self.mesh.num_layers
@@ -492,7 +493,9 @@ class MeshLayer(TransformerLayer):
         self.phase_loss_fn = phase_loss_fn
         super(MeshLayer, self).__init__(self.units, activation=activation, **kwargs)
         theta_init, phi_init, gamma_init = self.mesh.model.init
-        self.theta, self.phi, self.gamma = theta_init.to_tf("theta"), phi_init.to_tf("phi"), gamma_init.to_tf("gamma")
+        pi = tf.constant(np.pi)
+        pi2 = tf.constant(2 * np.pi)
+        self.theta, self.phi, self.gamma = theta_init.to_tf("theta", constraint_fns[0] if constraint_fns else lambda x: x - (pi * tf.floor(x / pi))), phi_init.to_tf("phi", constraint_fns[1] if constraint_fns else lambda x: x - (pi2 * tf.floor(x / pi2))), gamma_init.to_tf("gamma", constraint_fns[2] if constraint_fns else lambda x: x - (pi2 * tf.floor(x / pi2)))
         self.theta_fn, self.phi_fn, self.gamma_fn = self.mesh.model.theta_fn, self.mesh.model.phi_fn, self.mesh.model.gamma_fn
 
     @tf.function

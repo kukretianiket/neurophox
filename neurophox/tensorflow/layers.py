@@ -32,11 +32,13 @@ class RM(MeshLayer):
                  phi_init: Union[str, tuple, np.ndarray] = "random_phi",
                  gamma_init: Union[str, tuple, np.ndarray] = "random_gamma",
                  phase_loss_fn: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
+                 constraint_fns : Optional[List[Callable]] = None,
                  activation: Activation = None, **kwargs):
         super(RM, self).__init__(
             RectangularMeshModel(units, num_layers, hadamard, bs_error, basis, theta_init, phi_init, gamma_init),
             activation=activation, incoherent=incoherent,
-            phase_loss_fn=phase_loss_fn, **kwargs
+            phase_loss_fn=phase_loss_fn, 
+            constraint_fns=constraint_fns, **kwargs
         )
 
 
@@ -164,9 +166,51 @@ class SVD(CompoundTransformerLayer):
 
         super(SVD, self).__init__(
             units=self.units,
-            transformer_list=[self.v, self.diag, self.u]
+            # EDITED THIS: transformer_list=[self.v, self.diag, self.u]
+            transformer_list=[self.u, self.diag, self.v]
         )
 
+class CustomSVD(CompoundTransformerLayer):
+    """Singular value decomposition transformer for implementing a matrix.
+
+    Notes:
+        SVD requires you specify the unitary transformers used to implement the SVD in `unitary_transformer_dict`,
+        specifying transformer name and arguments for that transformer.
+
+    Args:
+        units: The number of inputs (:math:`M`) of the :math:`M \\times N` matrix to be modelled by the SVD
+        mesh_dict: The name and properties of the mesh layer used for the SVD
+        output_units: The dimension of the output (:math:`N`) of the :math:`M \\times N` matrix to be modelled by the SVD
+        pos_singular_values: Whether to allow only positive singular values
+        activation: Nonlinear activation function (:code:`None` if there's no nonlinearity)
+    """
+
+    def __init__(self, units: int, mesh_dict: Dict, output_units: Optional[int] = None,
+                 pos_singular_values: bool = False, activation: Activation = None):
+        self.units = units
+        self.output_units = output_units if output_units is not None else units
+        if output_units != units and output_units is not None:
+            raise NotImplementedError("Still working out a clean implementation of non-square linear operators.")
+        self.mesh_name = mesh_dict['name']
+        self.mesh_properties = mesh_dict.get('properties', {})
+        self.pos = pos_singular_values
+
+        mesh_name2layer = {
+            'rm': RM,
+            'prm': PRM,
+            'tm': TM
+        }
+
+        self.v = mesh_name2layer[self.mesh_name](units=units, name="v", **self.mesh_properties)
+        self.diag = CustomDiagonal(units, output_units=output_units, pos=self.pos)
+        self.u = mesh_name2layer[self.mesh_name](units=units, name="u", **self.mesh_properties)
+
+        self.activation = activation
+
+        super(CustomSVD, self).__init__(
+            units=self.units,
+            transformer_list=[self.u, self.diag, self.v]
+        )
 
 class DiagonalPhaseLayer(TransformerLayer):
     """Diagonal matrix of phase shifts
@@ -195,6 +239,57 @@ class DiagonalPhaseLayer(TransformerLayer):
     def inverse_transform(self, outputs: tf.Tensor):
         return self.inv_diag_vec * outputs
 
+class CustomDiagonal(TransformerLayer):
+    """Diagonal matrix of gains and losses (not necessarily real)
+
+    Args:
+        units: Dimension of the input (number of input waveguide ports), :math:`N`
+        is_complex: Whether to use complex values or not
+        output_units: Dimension of the output (number of output waveguide ports), :math:`M`.
+                      If :math:`M < N`, remove last :math:`N - M` elements.
+                      If :math:`M > N`, pad with :math:`M - N` zeros.
+        pos: Enforce positive definite matrix (only positive singular values)
+
+    """
+
+    def __init__(self, units: int, is_complex: bool = True, output_units: Optional[int] = None,
+                 pos: bool = False, **kwargs):
+        super(CustomDiagonal, self).__init__(units=units, **kwargs)
+        self.output_dim = output_units if output_units is not None else units
+        self.pos = pos
+        self.is_complex = is_complex
+        singular_value_dim = min(self.units, self.output_dim)
+        self.phases = tf.Variable(
+            name="phases",
+            initial_value=tf.constant((np.pi * np.random.randn(singular_value_dim, 2)) % np.pi, dtype=TF_FLOAT),
+            dtype=TF_FLOAT
+        )
+
+    @tf.function
+    def transform(self, inputs: tf.Tensor) -> tf.Tensor:
+        theta = tf.math.reduce_mean(self.phases, 1)
+        delta = (self.phases[:, 0] - self.phases[:, 1]) / 2
+        sigma = tf.math.exp(tf.complex(tf.zeros_like(theta), theta)) * tf.complex(tf.cos(delta), tf.zeros_like(delta))
+        diag_vec = tf.cast(sigma, TF_COMPLEX) if self.is_complex else sigma
+        if self.output_dim == self.units:
+            return diag_vec * inputs
+        elif self.output_dim < self.units:
+            return diag_vec * inputs[:self.output_dim]
+        else:
+            return tf.pad(diag_vec * inputs, tf.constant([[0, 0], [0, self.output_dim - self.units]]))
+
+    @tf.function
+    def inverse_transform(self, outputs: tf.Tensor) -> tf.Tensor:
+        theta = tf.math.reduce_mean(self.phases, 1)
+        delta = (self.phases[:, 0] - self.phases[:, 1]) / 2
+        sigma = np.exp(theta * 1j) * np.cos(delta)
+        inv_diag_vec = tf.cast(1 / sigma, TF_COMPLEX) if self.is_complex else 1 / sigma
+        if self.output_dim == self.units:
+            return inv_diag_vec * outputs
+        elif self.output_dim > self.units:
+            return inv_diag_vec * outputs[:self.units]
+        else:
+            return tf.pad(inv_diag_vec * outputs, tf.constant([[0, 0], [0, self.units - self.output_dim]]))
 
 class Diagonal(TransformerLayer):
     """Diagonal matrix of gains and losses (not necessarily real)
@@ -218,7 +313,8 @@ class Diagonal(TransformerLayer):
         singular_value_dim = min(self.units, self.output_dim)
         self.sigma = tf.Variable(
             name="sigma",
-            initial_value=tf.constant(2 * np.pi * np.random.randn(singular_value_dim), dtype=TF_FLOAT),
+            initial_value=tf.constant(sorted((abs(np.random.randn(singular_value_dim))), reverse=True), dtype=TF_FLOAT),
+            constraint=tf.keras.constraints.NonNeg,     # ADDED THIS, 31-05-24
             dtype=TF_FLOAT
         )
 
